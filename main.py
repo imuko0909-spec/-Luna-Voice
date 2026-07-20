@@ -12,6 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -23,6 +24,9 @@ DB_PATH = os.getenv("DATABASE_PATH", "data/yomiage.db")
 PORT = int(os.getenv("PORT", "10000"))
 MAX_READ_LENGTH = int(os.getenv("MAX_READ_LENGTH", "120"))
 AUTO_DISCONNECT_SECONDS = int(os.getenv("AUTO_DISCONNECT_SECONDS", "30"))
+VOICEVOX_ENGINE_URL = os.getenv("VOICEVOX_ENGINE_URL", "").strip().rstrip("/")
+DEFAULT_STYLE_ID = int(os.getenv("DEFAULT_STYLE_ID", "3"))
+FALLBACK_GTTS = os.getenv("FALLBACK_GTTS", "true").lower() in {"1","true","yes","on"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("yomiage")
@@ -47,7 +51,17 @@ class Database:
                 CREATE TABLE IF NOT EXISTS settings(
                     guild_id INTEGER PRIMARY KEY,
                     volume REAL NOT NULL DEFAULT 1.0,
-                    read_names INTEGER NOT NULL DEFAULT 1
+                    read_names INTEGER NOT NULL DEFAULT 1,
+                    style_id INTEGER NOT NULL DEFAULT 3,
+                    speed REAL NOT NULL DEFAULT 1.0,
+                    pitch REAL NOT NULL DEFAULT 0.0,
+                    intonation REAL NOT NULL DEFAULT 1.0
+                );
+                CREATE TABLE IF NOT EXISTS user_voice(
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    style_id INTEGER NOT NULL,
+                    PRIMARY KEY(guild_id,user_id)
                 );
                 CREATE TABLE IF NOT EXISTS dictionary(
                     guild_id INTEGER NOT NULL,
@@ -57,15 +71,26 @@ class Database:
                 );
                 """
             )
+            # 旧DBからの安全な追加
+            for sql in (
+                "ALTER TABLE settings ADD COLUMN style_id INTEGER NOT NULL DEFAULT 3",
+                "ALTER TABLE settings ADD COLUMN speed REAL NOT NULL DEFAULT 1.0",
+                "ALTER TABLE settings ADD COLUMN pitch REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE settings ADD COLUMN intonation REAL NOT NULL DEFAULT 1.0",
+            ):
+                try:
+                    con.execute(sql)
+                except sqlite3.OperationalError:
+                    pass
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=30)
 
-    def settings(self, guild_id: int) -> tuple[float, bool]:
+    def settings(self, guild_id: int) -> dict:
         with self.lock, self.connect() as con:
-            con.execute("INSERT OR IGNORE INTO settings(guild_id) VALUES(?)", (guild_id,))
-            row = con.execute("SELECT volume, read_names FROM settings WHERE guild_id=?", (guild_id,)).fetchone()
-        return float(row[0]), bool(row[1])
+            con.execute("INSERT OR IGNORE INTO settings(guild_id,style_id) VALUES(?,?)", (guild_id, DEFAULT_STYLE_ID))
+            row = con.execute("SELECT volume,read_names,style_id,speed,pitch,intonation FROM settings WHERE guild_id=?", (guild_id,)).fetchone()
+        return {"volume":float(row[0]),"read_names":bool(row[1]),"style_id":int(row[2]),"speed":float(row[3]),"pitch":float(row[4]),"intonation":float(row[5])}
 
     def set_volume(self, guild_id: int, volume: float):
         self.settings(guild_id)
@@ -98,18 +123,70 @@ class Database:
         return rows
 
 
+    def set_voice_setting(self, guild_id: int, column: str, value):
+        if column not in {"style_id","speed","pitch","intonation"}:
+            raise ValueError(column)
+        self.settings(guild_id)
+        with self.lock, self.connect() as con:
+            con.execute(f"UPDATE settings SET {column}=? WHERE guild_id=?", (value,guild_id))
+
+    def set_user_voice(self, guild_id: int, user_id: int, style_id: int):
+        with self.lock, self.connect() as con:
+            con.execute("INSERT INTO user_voice VALUES(?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET style_id=excluded.style_id", (guild_id,user_id,style_id))
+
+    def get_user_voice(self, guild_id: int, user_id: int):
+        with self.lock, self.connect() as con:
+            row=con.execute("SELECT style_id FROM user_voice WHERE guild_id=? AND user_id=?",(guild_id,user_id)).fetchone()
+        return int(row[0]) if row else None
+
+    def remove_user_voice(self, guild_id: int, user_id: int):
+        with self.lock, self.connect() as con:
+            return con.execute("DELETE FROM user_voice WHERE guild_id=? AND user_id=?",(guild_id,user_id)).rowcount>0
+
+
 db = Database(DB_PATH)
 
 
 class Session:
     def __init__(self):
         self.text_channel_id: Optional[int] = None
-        self.queue: asyncio.Queue[tuple[str, float]] = asyncio.Queue(maxsize=100)
+        self.queue: asyncio.Queue[tuple[str, float, int, dict]] = asyncio.Queue(maxsize=100)
         self.worker: Optional[asyncio.Task] = None
         self.auto_disconnect: Optional[asyncio.Task] = None
 
 
 sessions: dict[int, Session] = defaultdict(Session)
+
+VOICE_STYLES: dict[int,str] = {}
+HTTP: Optional[aiohttp.ClientSession] = None
+
+async def refresh_voices():
+    global HTTP, VOICE_STYLES
+    if not VOICEVOX_ENGINE_URL:
+        return {}
+    if HTTP is None or HTTP.closed:
+        HTTP=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+    try:
+        async with HTTP.get(f"{VOICEVOX_ENGINE_URL}/speakers") as r:
+            r.raise_for_status(); data=await r.json()
+        VOICE_STYLES={int(st["id"]):f'{sp["name"]}（{st["name"]}）' for sp in data for st in sp.get("styles",[])}
+        log.info("VOICEVOX voices=%s",len(VOICE_STYLES)); return VOICE_STYLES
+    except Exception:
+        log.exception("VOICEVOX speakers failed"); return VOICE_STYLES
+
+async def make_voicevox(text, style_id, cfg):
+    global HTTP
+    if not VOICEVOX_ENGINE_URL: raise RuntimeError("VOICEVOX_ENGINE_URL未設定")
+    if HTTP is None or HTTP.closed:
+        HTTP=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+    params={"text":text,"speaker":style_id}
+    async with HTTP.post(f"{VOICEVOX_ENGINE_URL}/audio_query",params=params) as r:
+        r.raise_for_status(); q=await r.json()
+    q["speedScale"]=cfg["speed"]; q["pitchScale"]=cfg["pitch"]; q["intonationScale"]=cfg["intonation"]
+    async with HTTP.post(f"{VOICEVOX_ENGINE_URL}/synthesis",params={"speaker":style_id},json=q) as r:
+        r.raise_for_status(); audio=await r.read()
+    filename=str(Path(tempfile.gettempdir())/f"voicevox_{uuid.uuid4().hex}.wav")
+    await asyncio.to_thread(Path(filename).write_bytes,audio); return filename
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -157,14 +234,19 @@ async def make_mp3(text: str) -> str:
 async def audio_worker(guild_id: int):
     s = sessions[guild_id]
     while True:
-        text, volume = await s.queue.get()
+        text, volume, style_id, cfg = await s.queue.get()
         filename = None
         try:
             guild = bot.get_guild(guild_id)
             voice = guild.voice_client if guild else None
             if not voice or not voice.is_connected():
                 continue
-            filename = await make_mp3(text)
+            try:
+                filename = await make_voicevox(text, style_id, cfg)
+            except Exception:
+                log.exception("VOICEVOX failed; fallback")
+                if not FALLBACK_GTTS: raise
+                filename = await make_mp3(text)
             source = discord.PCMVolumeTransformer(
                 discord.FFmpegPCMAudio(filename, before_options="-nostdin", options="-vn -loglevel warning"),
                 volume=volume,
@@ -268,7 +350,8 @@ async def enqueue(message: discord.Message):
     text = clean_text(message)
     if not text or not message.guild:
         return
-    volume, read_names = db.settings(message.guild.id)
+    cfg = db.settings(message.guild.id)
+    volume, read_names = cfg["volume"], cfg["read_names"]
     if read_names and isinstance(message.author, discord.Member):
         text = f"{message.author.display_name}、{text}"
     try:
@@ -280,6 +363,7 @@ async def enqueue(message: discord.Message):
 @bot.event
 async def on_ready():
     log.info("ログイン完了: %s", bot.user)
+    await refresh_voices()
     try:
         synced = await bot.tree.sync()
         log.info("%s個のコマンドを同期しました", len(synced))
@@ -429,6 +513,63 @@ def main():
         raise RuntimeError("環境変数 DISCORD_TOKEN を設定してください。")
     start_health_server()
     bot.run(TOKEN, log_handler=None)
+
+
+async def voice_choices(interaction: discord.Interaction,current: str):
+    if not VOICE_STYLES: await refresh_voices()
+    key=current.lower(); out=[]
+    for sid,name in VOICE_STYLES.items():
+        label=f"{name}｜ID:{sid}"
+        if not key or key in label.lower(): out.append(app_commands.Choice(name=label[:100],value=str(sid)))
+        if len(out)>=25: break
+    return out
+
+@bot.tree.command(name="声",description="サーバー標準のVOICEVOX音声を変更")
+@app_commands.describe(voice="ずんだもん等を検索")
+@app_commands.autocomplete(voice=voice_choices)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def set_voice(interaction: discord.Interaction,voice: str):
+    if not interaction.guild: return
+    try: sid=int(voice)
+    except ValueError: return await interaction.response.send_message("候補から選んでください",ephemeral=True)
+    db.set_voice_setting(interaction.guild.id,"style_id",sid)
+    await interaction.response.send_message(f"🎤 標準音声を **{VOICE_STYLES.get(sid,sid)}** に変更しました")
+
+@bot.tree.command(name="個人声",description="自分の投稿を読む声を変更")
+@app_commands.describe(voice="自分用の声")
+@app_commands.autocomplete(voice=voice_choices)
+async def personal_voice(interaction: discord.Interaction,voice: str):
+    if not interaction.guild: return
+    try: sid=int(voice)
+    except ValueError: return await interaction.response.send_message("候補から選んでください",ephemeral=True)
+    db.set_user_voice(interaction.guild.id,interaction.user.id,sid)
+    await interaction.response.send_message(f"🗣️ あなたの声を **{VOICE_STYLES.get(sid,sid)}** にしました",ephemeral=True)
+
+@bot.tree.command(name="個人声解除",description="自分専用の声を解除")
+async def personal_voice_remove(interaction: discord.Interaction):
+    if interaction.guild: db.remove_user_voice(interaction.guild.id,interaction.user.id)
+    await interaction.response.send_message("個人声を解除しました",ephemeral=True)
+
+@bot.tree.command(name="声一覧",description="VOICEVOXの声一覧を表示")
+async def voice_list(interaction: discord.Interaction):
+    await refresh_voices()
+    text="🎤 **声一覧**\n"+"\n".join(f"`{i}` {n}" for i,n in list(VOICE_STYLES.items())[:45])
+    await interaction.response.send_message(text[:1900] or "VOICEVOXへ接続できません",ephemeral=True)
+
+@bot.tree.command(name="話速",description="話す速さ 0.5〜2.0")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def speed_cmd(interaction: discord.Interaction,value: app_commands.Range[float,0.5,2.0]):
+    db.set_voice_setting(interaction.guild.id,"speed",float(value)); await interaction.response.send_message(f"話速を{value}に変更",ephemeral=True)
+
+@bot.tree.command(name="音程",description="声の高さ -0.15〜0.15")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def pitch_cmd(interaction: discord.Interaction,value: app_commands.Range[float,-0.15,0.15]):
+    db.set_voice_setting(interaction.guild.id,"pitch",float(value)); await interaction.response.send_message(f"音程を{value}に変更",ephemeral=True)
+
+@bot.tree.command(name="抑揚",description="抑揚 0〜2")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def intonation_cmd(interaction: discord.Interaction,value: app_commands.Range[float,0.0,2.0]):
+    db.set_voice_setting(interaction.guild.id,"intonation",float(value)); await interaction.response.send_message(f"抑揚を{value}に変更",ephemeral=True)
 
 
 if __name__ == "__main__":
